@@ -1,0 +1,90 @@
+
+
+
+library(here)
+library(dplyr)
+library(data.table)
+library(tidyr)
+
+folder_for_preds <- here("overall")
+mrp_preds <- read.csv(here(folder_for_preds, "overlay_preds_2.csv"))
+
+
+mrp_preds <- mrp_preds %>%
+  mutate(across(Conservative:Other, ~as.numeric(gsub("%", "", .x))/100))
+
+#pred_files <- list.files(path="overall/", pattern="preds_.*\\.csv", full.names = TRUE)
+#all_preds <- lapply(pred_files, \(x)read_csv(x)) %>%
+#  bind_rows()
+
+#all_preds %>% filter(level == "WNV") %>% 
+#mutate(turnout = 1-mean) %>% 
+#select(const_name, turnout) %>% 
+#rename(Constituency = const_name) %>% 
+#write.csv("overall/turnout_dec_2025.csv")
+
+
+
+
+# Read constituency lookup
+constituency_code_lookup <- read.csv(here(folder_for_preds, "const_code_name.csv")) %>%
+  rename("Constituency Code" = 'PCON24CD', "Constituency" = 'PCON24NM')
+
+### Raw implied vi
+electorates <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/other-files/electorate_size_const.csv") %>% select(Constituency=Constituency.name,Electorate)
+electorates$Constituency <- ifelse(grepl("Montgomeryshire",electorates$Constituency),"Montgomeryshire and Glyndwr", electorates$Constituency)
+electorates$Constituency <- ifelse(grepl("Ynys",electorates$Constituency),"Ynys Môn", electorates$Constituency)
+
+map <- mrp_preds
+
+map$Constituency <- ifelse(grepl("Montgomeryshire",map$Constituency),"Montgomeryshire and Glyndwr", map$Constituency)
+map$Constituency <- ifelse(grepl("Ynys",map$Constituency),"Ynys Môn", map$Constituency)
+map <- map %>% select(-any_of(c("X.1","orig_winner","Winner","Runner.Up", "GE_winner","Change","ID")))
+
+## remove doets from column names
+colnames(map) <- gsub("\\.", " ", colnames(map))
+
+## assumes map <- df
+
+vi_implied <- map %>% 
+  pivot_longer(cols = c("Conservative", "Labour", "Liberal Democrat", "Reform UK",
+                        "The Green Party", "Scottish National Party  SNP ", "Plaid Cymru",
+                        "Other"),
+               names_to = 'Party',
+               values_to = 'voteshare')
+
+
+turnout <- read.csv("overall/turnout_dec_2025.csv") %>% select(-X)
+
+## join vote shares with number of voters in each constituency
+vi_implied <- vi_implied %>% left_join(electorates,by="Constituency")
+vi_implied <- vi_implied %>% left_join(turnout,by="Constituency")
+vi_implied$voters <- as.numeric(vi_implied$Electorate)*vi_implied$turnout
+
+
+## make party_voters as the projected number of voters for each party
+vi_implied$party_voters <- vi_implied$voteshare*vi_implied$voters
+
+## this is by constituency
+vi_implied_by_constituency <- vi_implied
+
+
+
+write.csv(vi_implied_by_constituency, here("Implied VI", "dec_vi_implied_by_constituency_overlay_4.csv"), row.names = FALSE)
+
+
+ 
+vi_implied_winners <- vi_implied %>% group_by(Constituency) %>% slice_max(party_voters, n=1) %>% ungroup %>% group_by(Party) %>% count()
+vi_implied_winners
+
+## make number of voters by party as the sum of party voters across constituencies
+vi_implied <- vi_implied %>% group_by(Party) %>% summarize(votes = sum(party_voters))
+
+totalvotes <- sum(vi_implied$votes)
+vi_implied <- vi_implied %>% mutate(vi = votes/totalvotes)
+## added this - join winning seats with overall party voters and vote shares. 
+vi_implied_with_seats <- vi_implied %>% left_join(vi_implied_winners %>% rename(seats=n), by='Party')
+
+write.csv(vi_implied, here("Implied VI","dec_vi_implied_raw_overlay_4.csv"), row.names = FALSE)
+## this is a new one. 
+write.csv(vi_implied_with_seats,'dec_vi_implied_raw_with_seats.csv')

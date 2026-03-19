@@ -1,0 +1,855 @@
+---
+title: "Model Script"
+output: html_document
+date: "2025-12-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+wd <- getwd()
+if (wd != "/root") {
+  setwd("C:/Users/Zain/More In Common/More In Common Team Site - MRP")
+}; rm(wd)
+
+```
+
+```{r} 
+
+
+library(brms)
+library(dplyr)
+library(stringr)
+library(readr)
+library(readxl)
+library(data.table)
+library(rstan)
+library(future)
+library(future.apply)
+library(posterior)
+library(parallel)
+library(nnet)
+library(tidyverse)
+
+# brms settings
+chains <- 4
+iter <- 2500
+
+```
+
+```{r} 
+
+## load polls ## 
+
+options(timeout = 300)
+
+poll1 <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/polls/25-11-snap-post-budget-poll.csv")
+poll2 <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/polls/25-11-wellcome-trust-in-science.csv")
+poll3 <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/polls/25-11-wo11a-cop30-cycling.csv")
+poll4 <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/polls/25-11-wo11b-nesta-poppies-kisses.csv")
+poll5 <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/polls/25-11-wo11c-bbc-government-chaos-danish-model.csv")
+poll6 <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/polls/25-11-wo11d-covid-inquiry-ukraine-transgender.csv")
+poll7 <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/polls/25-11-wo11d-ukraine-cross-country.csv")
+poll8 <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/polls/25-12-wo12a-assisted-dying-economist-brexit.csv")
+poll9 <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/scripts/25-12-jrf-col-provisional-2k.csv")
+poll10 <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/scripts/25-12-cpre-liberty-provisional-15k.csv")
+poll11 <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/scripts/25-12-winter-10-provisional-data-n9k.csv")
+poll12 <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/scripts/25-12-wales-bluecross-provisional.csv")
+poll13 <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/scripts/25-12-justice-provisional-almost.csv")
+
+
+```
+
+
+```{r}
+
+if (detectCores() == 16) {
+  threads <- 3
+  workers <- 4
+}
+if (detectCores() == 8) {
+  threads <- 2
+  workers <- 4
+}
+if (detectCores() == 4) {
+  threads <- 1
+  workers <- 4
+}
+if (detectCores() == 32) {
+  threads <- 4
+  workers <- 4
+}
+
+if (detectCores() == 48) {
+  threads <- 11
+  workers <- 4
+}
+
+```
+
+
+```{r}
+
+## check all the variables and values are the same across the poll 
+
+
+poll_list <- list(poll1, poll2, poll3, poll4, poll5, poll6, poll7,  poll8, poll9, poll10, poll11, poll12, poll13)
+names(poll_list) <- paste0("poll", 1:13)
+
+
+vars_to_check <- c("ethnicity", "leaveremain", "ge2019", "education", 
+                   "workstatus", "ownrent", "gender", "welshlang", "ge2024", "votingintention")
+
+# Function to get unique values for each variable
+get_unique_values <- function(poll, var) {
+  if(var %in% names(poll)) {
+    unique(poll[[var]]) %>% sort() %>% as.character()
+  } else {
+    NA
+  }
+}
+
+
+results <- list()
+
+for(var in vars_to_check) {
+
+  values_by_poll <- map(poll_list, ~get_unique_values(.x, var))
+  
+
+  has_var <- map_lgl(values_by_poll, ~!all(is.na(.x)))
+  
+ 
+  all_values <- values_by_poll %>% 
+    discard(~all(is.na(.x))) %>% 
+    unlist() %>% 
+    unique() %>% 
+    sort()
+  
+  # Check if values are consistent
+  values_consistent <- values_by_poll %>% 
+    discard(~all(is.na(.x))) %>% 
+    map_lgl(~identical(sort(.x), sort(all_values))) %>% 
+    all()
+  
+  results[[var]] <- list(
+    present_in_all = all(has_var),
+    polls_with_var = names(poll_list)[has_var],
+    polls_missing_var = names(poll_list)[!has_var],
+    all_unique_values = all_values,
+    values_consistent = values_consistent,
+    values_by_poll = values_by_poll
+  )
+}
+
+for(var in vars_to_check) {
+  cat("\n====================\n")
+  cat("Variable:", var, "\n")
+  cat("Present in all polls:", results[[var]]$present_in_all, "\n")
+  
+  if(!results[[var]]$present_in_all) {
+    cat("Missing in:", paste(results[[var]]$polls_missing_var, collapse = ", "), "\n")
+  }
+  
+  cat("Values consistent across polls:", results[[var]]$values_consistent, "\n")
+  cat("All unique values:\n")
+  print(results[[var]]$all_unique_values)
+  
+  if(!results[[var]]$values_consistent) {
+    cat("\nValues by poll:\n")
+    print(results[[var]]$values_by_poll)
+  }
+}
+
+```
+
+```{r} 
+
+## Remove rows with empty strings in key variables
+vars_to_clean <- c("ownrent", "workstatus", "votingintention", "gender", "education", "ge2019", "leaveremain", "ethnicity") 
+
+remove_empty_strings <- function(df, cols) {
+  # Only keep columns that exist in this dataframe
+  cols_present <- cols[cols %in% names(df)]
+  
+  # Filter out rows where ANY of the present columns has an empty string
+  for(col in cols_present) {
+    df <- df %>% filter(.data[[col]] != "")
+  }
+  df
+}
+
+poll_list_cleaned <- map(poll_list, ~remove_empty_strings(.x, vars_to_clean))
+
+poll1 <- poll_list_cleaned[[1]]
+poll2 <- poll_list_cleaned[[2]]
+poll3 <- poll_list_cleaned[[3]]
+poll4 <- poll_list_cleaned[[4]]
+poll5 <- poll_list_cleaned[[5]]
+poll6 <- poll_list_cleaned[[6]]
+poll7 <- poll_list_cleaned[[7]]
+poll8 <- poll_list_cleaned[[8]]
+poll9 <- poll_list_cleaned[[9]]
+poll10 <- poll_list_cleaned[[10]]
+poll11 <- poll_list_cleaned[[11]]
+poll12 <- poll_list_cleaned[[12]]
+poll13 <- poll_list_cleaned[[13]]
+```
+
+
+
+```{r}
+#### Survey Data ####
+# Filter each poll by date
+polls_list <- list(poll1, poll2, poll3, poll4, poll5, poll6, poll7, poll8, 
+                   poll9, poll10, poll11, poll12, poll13)
+
+polls_list <- lapply(polls_list, function(poll) {
+  # Handle different date column names
+  if ("START_DATE" %in% names(poll)) {
+    poll <- poll %>% 
+      mutate(START_DATE = lubridate::parse_date_time(START_DATE, 
+                                                       orders = c("dmy HM", "ymd HMS", "mdy HMS"))) %>%
+      filter(START_DATE >= as.POSIXct("2025-12-01 00:00:00"))
+  } else if ("start_date" %in% names(poll)) {
+    poll <- poll %>% 
+      mutate(start_date = lubridate::parse_date_time(start_date, 
+                                                       orders = c("dmy HM", "ymd HMS", "mdy HMS"))) %>%
+      filter(start_date >= as.POSIXct("2025-12-01 00:00:00"))
+  }
+  return(poll)
+})
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+## make sure only keep onservations with unique cid and post budget poll those the day after the budget and later 27 NovemberS
+## make sure poll 1 start date is day after budget  27th November 
+## make sure unique cid number
+
+## do this for all 10 polls 
+#poll1 <- poll1 %>% 
+ # mutate(START_DATE = lubridate::ymd_hms(START_DATE)) %>%
+#  filter(START_DATE >= lubridate::ymd_hms("2025-11-27 00:00:00"))
+
+# poll2 <- poll2 %>% 
+#  mutate(START_DATE = lubridate::ymd_hms(START_DATE)) %>%
+ # filter(START_DATE >= lubridate::ymd_hms("2025-11-27 00:00:00"))
+
+
+col_list <- c('.id', 'CID', 'cid',
+              'gender','region','age_1','education','ownrent',
+              'religion', 'ge2019',
+              'ethnicity','workstatus', 'postcode_1','const_name',
+              'leaveremain','likelihoodtovote','votingintention','votingforced',
+              'indyref', 'welshlang',
+              'START_DATE', 'start_date',
+              'ge2024') 
+
+poll_list <- list(poll1, poll2, poll3, poll4, poll5, poll6, poll7, poll8, poll9, poll10, poll11, poll12, poll13)
+names(poll_list) <- paste0("poll", 1:13)
+
+poll_list <- lapply(poll_list, \(x){
+  if(!is.character(x$START_DATE)){
+    x$START_DATE <- as.character(x$START_DATE)
+  }
+  x %>% select(any_of(col_list))})
+polldata <- bind_rows(poll_list, .id="poll")
+
+## shows the table of frequency counts for cids 
+## they are all 1, so no duplicates
+table(table(polldata$cid))
+
+## this should also be TRUE if there are no duplicates, but in this case poll8 doesn't have CIDs
+length(unique(polldata$cid)) == nrow(polldata)
+
+## if there were duplicates
+## to keep the first occurrence
+## polldata %>% group_by(cid) %>% slice_head(n=1)
+## to keep the last occurrence
+## polldata %>% group_by(cid) %>% slice_tail(n=1)
+
+
+print(paste('polldata has',nrow(polldata), 'rows')) #check
+
+```
+
+
+```{r}
+#### Constituency level data ####
+aux <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/other-files/const_data_full_new.csv")
+aux <- aux %>% mutate(const_name = gsub("Ynys Mon", "Ynys Môn", const_name))
+
+elex_results <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/other-files/ge2024_results.csv")%>%
+  mutate(const_name = gsub("Ynys M\xf4n", "Ynys Môn", const_name, useBytes = TRUE)) %>% select(const_name,turnout,ge_con,ge_lab,ge_libdem,ge_ref,ge_green,ge_snp,ge_pc,ge_oth)
+
+vote_cols <- c("ge_con", "ge_lab", "ge_libdem", "ge_ref", 
+               "ge_green", "ge_snp", "ge_pc", "ge_oth")
+
+# Then multiply by turnout so they sum to the remaining proportion
+elex_results[vote_cols] <- elex_results[vote_cols] * (elex_results$turnout)
+elex_results <- elex_results %>% mutate(turnout = 1-turnout)
+
+aux <- aux %>% left_join(elex_results,by='const_name')
+```
+
+```{r}
+# polldata$cid <- ifelse(is.na(polldata$cid), polldata$CID, polldata$cid)
+#filter by date
+# polldata$date <- ifelse(is.na(polldata$START_DATE), polldata$start_date, polldata$START_DATE)
+# polldata$date1 <- as.POSIXct(polldata$START_DATE, format = "%Y-%m-%d %H:%M:%S")
+# polldata$date2 <- as.POSIXct(polldata$START_DATE, format = "%d/%m/%Y %H:%M")
+# 
+# polldata$date1 <- as.Date(polldata$date, format = "%d/%m/%Y %R")
+# polldata$date2 <- as.Date(polldata$date, format = "%Y-%m-%d %T")
+# polldata$date3 <- as.POSIXct(polldata$date, format = "%m/%d/%Y %H:%M:%S")
+# polldata$date <- ifelse(is.na(polldata$date1), as.Date(polldata$date2, format = "%d/%m/%Y"), as.Date(polldata$date1, format = "%d/%m/%Y"))
+# polldata$date <- ifelse(is.na(polldata$date), as.Date(polldata$date3, format = "%d/%m/%Y"), polldata$date)
+# polldata$date <- as.Date(polldata$date)
+# 
+# polldata <- polldata %>% filter(date >= filter_date)
+print(paste('polldata has',nrow(polldata), 'rows')) #check
+
+#log of day of poll
+# polldata$max_date <- max(polldata$date)
+# polldata$min_date <- min(polldata$date)
+# polldata$day <- as.double(difftime(polldata$date, polldata$min_date, units = "days")) + 1
+# polldata$log_day <- log(polldata$day + 1)
+
+#clean constituencies
+
+options(timeout = 300)
+if (!exists("pc_lookup")) {pc_lookup <- read.csv('https://mrp-psf.ams3.digitaloceanspaces.com/other-files/postcodelookup.csv')}
+
+## right now, observations in postcodes that are in two constituencies are assigned to both of them, duplicating that observation
+## may want to flag this to see if they would rather only consider people who can be cleanly assigned to a single constituency.  If so: 
+pc_lookup <-  pc_lookup %>% select(postcode, name) %>% distinct() %>%  group_by(postcode) %>% filter(length(unique(name)) == 1) 
+polldata <- polldata %>% rename('postcode'='postcode_1') %>% left_join(pc_lookup %>% select(postcode,name),by='postcode')
+print(paste(nrow(subset(polldata,!is.na(polldata$name))), 'rows have constituency'))
+polldata <- polldata  %>% rename('constituency'='name')
+polldata$constituency <- ifelse(polldata$postcode=="NO POSTCOD",polldata$const_name,polldata$constituency) #workaround for dynata appended data
+print(paste(nrow(subset(polldata,!is.na(polldata$constituency))), 'rows have constituency'))
+
+## Attempt to drop duplicates without knowing CID
+# prospective_overlaps <- poll8 %>% 
+#   filter(postcode_1 != "") %>% 
+#   select(gender, age_1, ethnicity, education, ownrent, borninuk, religion, postcode_1) %>% 
+#   group_by(gender, age_1, ethnicity, education, ownrent, borninuk, religion, postcode_1) %>% 
+#   distinct()
+# 
+# poll9b <- poll9 %>% anti_join(prospective_overlaps)
+
+## check if duplicate respondetns in poll 9 from poll  8 using RESP_TOKEN  
+#poll9c <- poll9 %>% anti_join(poll8 %>% ungroup %>% select(RESP_TOKEN))
+
+#tmp <- poll8 %>% select(vi8 = votingintention, RESP_TOKEN) %>% left_join(poll9 %>% select(vi9 = votingintention, RESP_TOKEN))
+#table(tmp$vi8, tmp$vi9)
+
+## results: drop poll9 altogether because all observations are duplicates from poll 8. 
+```
+
+
+
+
+
+```{r}
+polldata <- polldata %>% filter(constituency != "")
+polldata$constituency <- gsub("Ynys Mon", "Ynys Môn", polldata$constituency, useBytes = TRUE)
+polldata$constituency <- gsub("Ynys M\xf4n", "Ynys Môn", polldata$constituency, useBytes = TRUE)
+polldata$constituency <- gsub("Ynys MÌ«n", "Ynys Môn", polldata$constituency, useBytes = TRUE)
+polldata$constituency <- gsub("Ynys Mon", "Ynys Môn", polldata$constituency, useBytes = TRUE)
+polldata$constituency <- gsub("Ynys MÃ´n", "Ynys Môn", polldata$constituency, useBytes = TRUE)
+polldata$constituency <- gsub("Montgomeryshire and Glynd  r", "Montgomeryshire and Glyndwr", polldata$constituency, useBytes = TRUE)
+polldata$constituency <- gsub("Montgomeryshire and Glynd_r", "Montgomeryshire and Glyndwr", polldata$constituency, useBytes = TRUE)
+polldata$constituency <- gsub("Montgomeryshire and Glynd?r", "Montgomeryshire and Glyndwr", polldata$constituency, useBytes = TRUE)
+polldata$constituency <- gsub("Montgomeryshire and Glynd_r", "Montgomeryshire and Glyndwr", polldata$constituency, useBytes = TRUE)
+polldata$constituency <- gsub("Montgomeryshire$", "Montgomeryshire and Glyndwr", polldata$constituency, useBytes = TRUE)
+polldata$constituency <- gsub("Montgomeryshire and GlyndÅµr", "Montgomeryshire and Glyndwr", polldata$constituency, useBytes = TRUE)
+polldata$constituency <- ifelse(grepl("Montgomeryshire", polldata$constituency),"Montgomeryshire and Glyndwr", polldata$constituency)
+polldata$constituency <- ifelse(grepl("Ynys", polldata$constituency),"Ynys Môn", polldata$constituency)
+
+const_name_short <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/other-files/const_name_short.csv")
+const_name_short <- const_name_short %>% mutate(const_long = ifelse(grepl("Ynys", const_name_short$const_long),"Ynys MÃ´n", const_name_short$const_long))
+const_name_short <- const_name_short %>% mutate(const_short = ifelse(grepl("Ynys", const_name_short$const_short),"Ynys MÃ´n", const_name_short$const_short))
+polldata <- left_join(polldata, const_name_short, join_by(constituency==const_short))
+polldata$constituency <- ifelse(is.na(polldata$const_long), polldata$constituency, polldata$const_long)
+rm(const_name_short)
+polldata$const_name <- polldata$constituency
+
+polldata <- left_join(polldata,aux,by='const_name')
+polldata$region <- polldata$region_name
+
+polldata <- polldata %>% filter(region != "Northern Ireland")
+
+```
+
+
+
+
+
+```{r} 
+polldata$votingintention <- ifelse(polldata$votingintention == "Another party", "Another party/Independent candidate",
+                                   ifelse(polldata$votingintention == "Another party/Independent Candidate", "Another party/Independent candidate", 
+                                          ifelse(polldata$votingintention == "Another party / Independent candidate", "Another party/Independent candidate", 
+                                                 ifelse(polldata$votingintention == "Another party / An independent candidate", "Another party/Independent candidate",
+                                                        polldata$votingintention))))
+
+
+polldata$votingintention <- ifelse(polldata$votingintention == "Liberal Democrats","Liberal Democrat",polldata$votingintention)
+polldata$votingintention <- ifelse(polldata$votingintention == "Conservatives","Conservative",polldata$votingintention)
+
+polldata$votingforced <- ifelse(polldata$votingforced == "Liberal Democrats","Liberal Democrat",polldata$votingforced)
+polldata$votingforced <- ifelse(polldata$votingforced == "Conservatives","Conservative",polldata$votingforced)
+
+polldata$votingforced <- ifelse(polldata$votingforced == "Another party", "Another party/Independent candidate",
+                                ifelse(polldata$votingforced == "Another party / Independent candidate", "Another party/Independent candidate",
+                                       ifelse(polldata$votingforced == "Another party/Independent Candidate", "Another party/Independent candidate", polldata$votingforced)))
+
+polldata$ge2019 <- ifelse(polldata$ge2019 == "Another party", "Another party/Independent candidate",
+                          ifelse(polldata$ge2019 == "Another Party/Independent candidate", "Another party/Independent candidate",
+                                 ifelse(polldata$ge2019 == "Don't know/Can't remember", "DK_DNV", 
+                                        ifelse(polldata$ge2019 == "Can't remember", "DK_DNV", 
+                                               ifelse(polldata$ge2019 == "Don't know/prefer not to say", "DK_DNV",
+                                                      ifelse(polldata$ge2019 == "I did not/could not vote", "DK_DNV",
+                                                             ifelse(polldata$ge2019 == "I did not / could not vote", "DK_DNV",
+                                                                    ifelse(grepl("Labour", polldata$ge2019, ignore.case = TRUE), "Labour",
+                                                                           ifelse(grepl("Conservative", polldata$ge2019, ignore.case = TRUE), "Conservative",
+                                                                                  ifelse(grepl("Liberal Democrat", polldata$ge2019, ignore.case = TRUE), "Liberal Democrats",
+                                                                                         ifelse(grepl("Plaid Cymru", polldata$ge2019, ignore.case = TRUE), "Plaid Cymru",
+                                                                                                ifelse(grepl("SNP", polldata$ge2019, ignore.case = TRUE), "Scottish National Party (SNP)",
+                                                                                                       ifelse(grepl("Brexit", polldata$ge2019, ignore.case = TRUE), "The Brexit Party",
+                                                                                                              ifelse(grepl("Green Party", polldata$ge2019, ignore.case = TRUE), "The Green Party",
+                                                                                                                     polldata$ge2019
+                                                                                                              ))))))))))))))
+
+
+polldata$age_level <- ifelse(polldata$age_1 < 25,'18-24',
+                             ifelse(polldata$age_1 < 35,'25-34',
+                                    ifelse(polldata$age_1 < 45,'35-44',
+                                           ifelse(polldata$age_1 < 55,'45-54',
+                                                  ifelse(polldata$age_1 < 65,'55-64',
+                                                         ifelse(polldata$age_1 < 75,'65-74','75+'))))))
+polldata$age_level <- ifelse(is.na(polldata$age_1), polldata$age_weight, polldata$age_level)
+
+# exclude pc if not in wales
+exc_pc <- polldata %>% filter((region_name != "Wales") &(votingintention == "Plaid Cymru"))
+polldata <- subset(polldata,!(polldata$cid%in%exc_pc$cid))
+
+# exclude snp if not in scotland
+
+exc_snp <- polldata %>% filter((region_name != "Scotland") & (votingintention == "Scottish National Party (SNP)"))
+polldata <- subset(polldata,!(polldata$cid%in%exc_snp$cid))
+
+#adj voting intention and turnout
+polldata$adjvotingintention<- ifelse(polldata$votingintention=="Don't know",polldata$votingforced,polldata$votingintention) ##squeeze don't knows
+polldata <- subset(polldata,polldata$adjvotingintention != "Don't know") ## exclude double dont knows
+polldata <- polldata %>% mutate(likelihoodtovote=recode(likelihoodtovote,'10 - Certain to vote'='10','0 - Certain not to vote'='0',"Don't know"='0'))
+polldata$likelihoodtovote <- as.numeric(polldata$likelihoodtovote)
+
+polldata$adjvotingintention <- ifelse((polldata$ge2019%in%c("Don't know",'I did not vote','I was too young to vote'))&(polldata$age_level=="18-24")&(polldata$likelihoodtovote<10),'WNV',
+                                      ifelse(!(polldata$ge2019%in%c("Don't know",'I did not vote','I was too young to vote'))&(polldata$age_level=="18-24")&(polldata$likelihoodtovote<8),'WNV',
+                                             ifelse((polldata$age_level=="18-24")&(polldata$likelihoodtovote<9),"WNV",polldata$adjvotingintention)))
+polldata$adjvotingintention<- ifelse(polldata$adjvotingintention=='Another party/Independent candidate',"Other",polldata$adjvotingintention)
+polldata$adjvotingintention<- ifelse(polldata$adjvotingintention%in%c('I would not vote'),"WNV",polldata$adjvotingintention)
+polldata$adjvotingintention<- ifelse(polldata$adjvotingintention%in%c('I will not vote'),"WNV",polldata$adjvotingintention)
+
+
+polldata <- polldata %>%
+  mutate(ethn_level = case_when(
+    grepl("^Asian", ethnicity) ~ "Asian",
+    grepl("^Black", ethnicity) ~ "Black", 
+    grepl("^White", ethnicity) ~ "White",
+    grepl("^Mixed", ethnicity) ~ "Mixed",
+    grepl("^Other", ethnicity) ~ "Other",
+    TRUE ~ ethnicity  # keeps original value if none match
+  ))
+
+polldata <- polldata %>% filter(ethn_level != "Prefer not to say")
+polldata$ge2019 <- recode(polldata$ge2019,"The Brexit Party"="Brexit Party",
+                          "The Green Party"="Green Party",
+                          "Another party/Independent candidate"="Other",
+                          "Another party"="Other",
+                          "Scottish National Party (SNP)"="Scottish National Party",
+                          "Don't know"="DK_DNV",
+                          "Don’t know"="DK_DNV",
+                          "I did not vote"="DK_DNV",
+                          "I was too young to vote"="NA",
+                          "Change UK" = "Other",
+                          "Conservative Party"="Conservative",
+                          "I could not vote"="NA",
+                          "Labour Party"="Labour",
+                          "Liberal Democrats"="Liberal Democrat",
+                          "Another party / An independent candidate" = "Other")
+polldata$euref <- recode(polldata$leaveremain,"Don't know"="DK_DNV",
+                         "Don't know/prefer not to say"="DK_DNV",
+                         "I did not/could not vote"="DK_DNV",
+                         "I did not vote"="DK_DNV",
+                         "I was too young to vote"="DK_DNV",
+                         "Can't remember"="DK_DNV",
+                         "Did not vote"="DK_DNV")
+polldata$edu_level <- recode(polldata$education,
+                             "Vocational or Technical Qualifications Completed (e.g. HND, NVQ)"='No degree',
+                             "Secondary Education Completed (GCSE / O Level / CSE or equivalent)"='No degree',
+                             "Doctorate, Post-doctorate or equivalent  (Higher Degree)"='Degree',
+                             "Secondary Education Completed (A Level or equivalent)"='No degree',
+                             "University Education Completed (First Degree e.g. BA, BSc)"='Degree',
+                             "Postgraduate Education Completed  (e.g. Masters)"='Degree',
+                             "Incomplete Secondary Education  (Below GCSE / O Level)"='No degree',
+                             "Some Vocational or Technical Qualifications"='No degree',
+                             "Incomplete Secondary Education  (Below GCSE /O Level)"='No degree',
+                             "Secondary Education Completed (GCSE /O Level /CSE or equivalent)"='No degree',
+                             "Prefer not to answer"='No degree',
+                             "Lower Secondary School"="No degree",
+                             "Post-graduate"="Degree",
+                             "Some Vocational or Technical Qualifications"="No degree",
+                             "University"="Degree",
+                             "Upper Secondary School"="No degree",
+                             "Vocational/Technical college"="No degree",
+                             "Doctorate, Post-doctorate or equivalent (Higher Degree)"="Degree",
+                             "Incomplete Secondary Education (Below GCSE/O Level)"="No degree",
+                             "Postgraduate Education Completed (e.g. Masters)"= "Degree",
+                             "Secondary Education Completed (GCSE/O Level/CSE or equivalent)"="Degree")
+polldata$econ_level <- recode(polldata$workstatus,
+                              "Homemaker/Househusband/Housewife etc"="Inactive",
+                              "Homemaker/Househusband/Housewife etc."="Inactive",
+                              "Not working and not seeking work"="Inactive",
+                              "Not working/temporarily unemployed/sick but seeking work"="Unemployed",
+                              "Prefer not to say"="Inactive",
+                              "Retired"="Inactive",
+                              "Retired on a state pension only"="Inactive",
+                              "Retired with a private pension"="Inactive",
+                              "Student"="Inactive",
+                              "Working full time - working 30 hours per week or more"="Employed",
+                              "Working part time - working less than 30 hours per week"="Employed",
+                              "Full-time employed"="Employed",
+                              "Homemaker"="Inactive",
+                              "Military"="Employed",
+                              "Other"="Inactive",
+                              "Out of work but looking"="Unemployed",
+                              "Part-time employed"="Employed",
+                              "Self-employed"="Employed",
+                              "Unable to work"="Inactive",
+                              "Unemployed and not looking for work (and not retired)"="Inactive")
+polldata$housing <- recode(polldata$ownrent,
+                           "Own outright"='Own',
+                           "Owned outright"='Own',
+                           "Own with a mortgage or loan"='Own',
+                           "Owned with a mortgage or loan"='Own',
+                           "Rent from the housing association"='Rent',
+                           "Rented from the housing association"='Rent',
+                           "Privately rent"='Rent',
+                           "Privately rented"="Rent",
+                           "Rent free"='Other',
+                           "Prefer not to say"='Other',
+                           "Rent from the council"='Rent',
+                           "Rented from the council"='Rent',
+                           "Home owner with mortgage"="Own",
+                           "Home owner without mortgage"="Own",
+                           "Living with parents or family"="Other",
+                           "Rent from council or local authority"="Rent")
+
+polldata <- polldata %>% filter(gender != "Other (please specify)")
+polldata <- rename(polldata,'sex_level'='gender')
+polldata$sex_level <- recode(polldata$sex_level,
+                             "Male"="Male",
+                             "Female"="Female",
+                             "Man"="Male",
+                             "Woman"="Female")
+polldata<-polldata %>%filter(polldata$sex_level%in%c("Male","Female"))
+polldata$rel_level <- recode(polldata$religion,
+                             "Prefer not to say"='Not answered',
+                             "Christian (including Church of England, Catholic, Protestant and all other Christian denominations)"="Christian",
+                             "Any other religion, write in"="Other religion",
+                             "Other"='Other religion')
+polldata$welsh_level <- recode(polldata$welshlang,
+                               "I can speak Welsh"='Fluent',
+                               "I cannot speak Welsh but I can understand, read or write Welsh"='Limited',
+                               "I can't speak, understand, read or write Welsh"="None",
+                               "NA"="Not Available")
+polldata <- polldata %>% filter(ge2024 != "")
+polldata$ge2024 <- recode(polldata$ge2024,
+                          "Another party"="Other",
+                          "Another party / An independent candidate"="Other",
+                          "Another party/Independent candidate"="Other",
+                          "Another party / Independent candidate"="Other",
+                          "Conservatives"="Conservative",
+                          "Don't know"="DK_DNV",
+                          "Can't remember"="DK_DNV",
+                          "Don't know/prefer not to say"="DK_DNV",
+                          "I did not vote"="DK_DNV",
+                          "I did not/could not vote"="DK_DNV",
+                          "I did not / could not vote"="DK_DNV",
+                          "I was too young to vote"="DK_DNV",
+                          "Scottish National Party (SNP)"="Scottish National Party",
+                          "The Green Party"="Green Party")
+
+polldata$welsh_level <- ifelse(polldata$region != "Wales","Not Available",polldata$welsh_level)
+polldata$welsh_level <- ifelse(polldata$welsh_level == "", "Not Available", polldata$welsh_level)
+
+polldata$indyref <- ifelse(polldata$indyref=="","Not Available",polldata$indyref)
+polldata$indyref <- recode(polldata$indyref,
+                           'I did not vote'='DK_DNV',
+                           'I did not /could not vote'="DK_DNV",
+                           'I was too young to vote'='DK_DNV',
+                           "Don't know"='DK_DNV',
+                           'AGAINST Scottish independence'='No',
+                           'FOR Scottish independence'='Yes')
+polldata$region <- recode(polldata$region, "South East England"="South East",
+                          "North East England"="North East",
+                          "South West England"="South West",
+                          "North West England"="North West",
+                          "Yorkshire and the Humber"="Yorkshire & Humber",
+                          "Greater London"="London", 
+                          "East of England"="Eastern")
+polldata <- polldata %>% select(, 'poll', 'cid', 'votingintention', 'votingforced',
+                                'adjvotingintention', 'likelihoodtovote', 
+                                'const_name','age_level','sex_level','edu_level','econ_level',
+                                'ethn_level','housing',
+                                'rel_level','region',
+                                'euref','ge2019', 'indyref', 'welsh_level',
+                                'ge2024')
+## 'date', 'day', 'log_day',
+
+polldata <- polldata %>% left_join(aux,by='const_name')
+
+polldata <- polldata %>%
+  filter(ge2019 != "",
+         age_level != "")
+
+### check categories
+polldata %>% group_by(ge2019) %>% count()
+polldata %>% group_by(ge2024) %>% count()
+polldata %>% group_by(age_level) %>% count()
+polldata %>% group_by(sex_level) %>% count()
+polldata %>% group_by(edu_level) %>% count()
+polldata %>% group_by(euref) %>% count()
+polldata %>% group_by(ethn_level) %>% count()
+polldata %>% group_by(housing) %>% count()
+polldata %>% group_by(indyref) %>% count()
+polldata %>% group_by(rel_level) %>% count()
+polldata %>% group_by(welsh_level) %>% count()
+polldata %>% group_by(votingintention) %>% count()
+polldata %>% group_by(votingforced) %>% count()
+                   
+                      
+
+
+```
+
+```{r}
+polldata <- polldata %>% 
+  mutate(across(c(age_level, sex_level), as.factor))
+
+
+#### split up data by countries ####
+## remove poll 9 due to duplication with poll 8
+
+# polldata <- polldata %>% filter(poll != "poll9")
+
+
+
+
+
+
+polldata_eng <- subset(polldata, !(polldata$region_name %in% c('Scotland','Wales'))) # england data only
+polldata_eng <- subset(polldata_eng,!(polldata_eng$adjvotingintention%in%c("Scottish National Party (SNP)", 'Plaid Cymru'))) # excluding SNP/PC for english voters
+polldata_eng <- subset(polldata_eng,!(polldata_eng$ge2019%in%c("Scottish National Party (SNP)", 'Plaid Cymru')))
+
+polldata_wales <- subset(polldata, polldata$region_name=='Wales') # wales data only
+polldata_wales <- subset(polldata_wales,!polldata_wales$adjvotingintention%in%c("Scottish National Party (SNP)")) # excluding SNP for welsh voters
+polldata_wales <- subset(polldata_wales,!(polldata_wales$ge2019=='Scottish National Party (SNP)'))
+
+polldata_scot <- subset(polldata, polldata$region_name=='Scotland') # scotland data only
+polldata_scot <- subset(polldata_scot,!(polldata_scot$adjvotingintention%in%c('Plaid Cymru'))) # excluding PC for scottish voters
+polldata_scot <- subset(polldata_scot,!(polldata_scot$ge2019=='Plaid Cymru'))
+```
+
+```{r}
+## Suggestions 
+## 1. Change age_level and sex_level to factors in the data and replace age_level*sex_level with (1|age_level:sex_level) in the models. 
+##.   This will put a random effect on the combination of values of age and sex.  
+##.   Things that vary at the individual level and are also in the post-stratification frame, should be treated as random effects. 
+## 2. Remove collinear terms for council_* and ge_* - these variables are compositional - they sum to 1 for each observation meaning they 
+##.   are perfectly collinear.  This causes issues for model convergence - particularly slow mixing in the markov chains.  Removing one of 
+##.   the terms (doesn't matter which one) from each of ge_* and council_* and also removing any terms that have no variance (i.e., are all 0)
+##.   will speed up the model runs and also improve convergence.
+## 3. Use slightly wider priors (e.g., normal(0, 2.5)).  These still have some good regularizing qualities, but not as informative.  Could 
+##    be in the wales model, using 1 or 1.5 sd instead of 2.5 would be worthwhile since lots of categories and few observations. 
+
+## The current implementation of the priors seems a little unclear.  For example, the prior specification: prior(normal(0.17,1), dpar = muLabour) sets the prior
+## for all fixed-effects coefficients (the variables depriv_index-council_snp) for the choice of Labour versus Conservative (the reference) to N(0.17, 1).  It seems 
+## unlikely that they would all be positive and the prior sd=1 seems like it could be a bit overly informative.  To me, a better approach would be to 
+## set the prior means to zero ( no assumption about direction) and use a slightly wider sd.  I think we don't want something properly uninformative - the model has a lot of parameters
+## so there are benefits to some degree of regularization (shrinkage toward zero).  Perhaps after some trial and error, we will end up using prior sd=1, but 
+## I would suggest starting a bit wider than that (like 2.5 or 4) and see what we get.  The point of the regularizing is to keep coefficients from heading 
+## off toward -Inf or +Inf
+
+
+## I think using a prior of  SD = 2.5 is preferable we want to let the data speak for itself. The SD = 1 prior ##would constrain coefficients too tightly around zero, essentially saying we're very confident effects should ##be small. But we don't actually have strong prior evidence for that. The SD = 2.5 prior still provides some ##regularization to prevent  instability, but gives the model more flexibility to detect the actual patterns in ##the data
+
+```
+
+```{r}
+
+formula_scot <-  adjvotingintention ~
+  (1 | ge2019) + (1 | ge2024) + (1|age_level:sex_level) +
+  (1 | edu_level) + (1 | euref) + (1 | econ_level) + (1 | ethn_level) + (1 | housing) + (1 | indyref) + (1 | rel_level) +
+  scale(depriv_index) + scale(avg_ruc) + scale(euref_leave) + scale(house_prices_perc) +
+  scale(pct_self_emp) + scale(indyref_const) + scale(veterans) + scale(ukip_2015) + scale(students) +
+  ge_lab + ge_libdem + ge_snp + ge_oth + ge_ref + turnout +
+  council_lab + council_libdem + council_green + council_other + council_snp
+
+# prior_scot <- c(prior(normal(0.17,1), dpar = muLabour),
+#                 prior(normal(0.1,1), dpar = muLiberalDemocrat),
+#                 prior(normal(0.20,1), dpar = muReformUK),
+#                 prior(normal(0.07,1),dpar = muTheGreenParty),
+#                 prior(normal(0.11,1), dpar = muWNV),
+#                 prior(normal(0.28,1), dpar = muScottishNationalPartySNP),
+#                 prior(normal(0,1), dpar = muOther))
+
+
+prior_scot <- c(prior(normal(0,2.5), dpar = muLabour),
+                prior(normal(0,2.5), dpar = muLiberalDemocrat),
+                prior(normal(0,2.5), dpar = muReformUK),
+                prior(normal(0,2.5), dpar = muTheGreenParty),
+                prior(normal(0,2.5), dpar = muWNV),
+                prior(normal(0,2.5), dpar = muScottishNationalPartySNP),
+                prior(normal(0,2.5), dpar = muOther))
+
+print(Sys.time())
+model_scot <- brm(formula_scot,
+                  data=polldata_scot,
+                  family= categorical(link = "logit"),
+                  prior=prior_scot,
+                  seed=320,
+                  silent=0,
+                  iter=2500,
+                  backend="cmdstanr", 
+                  warmup=1000,
+                  chains=4,
+                  cores=4,
+                  refresh=20)
+
+
+print(Sys.time())
+summary(model_scot)
+
+if (getwd() == "/root") {
+  saveRDS(model_scot, paste0("scot-",Sys.Date(),"_",model_desc,".rds"))
+} else {
+  saveRDS(model_scot,paste0("BRMS Models/scot-",Sys.Date(),"_",model_desc,".rds"))
+}
+
+#### wales modelling ####
+
+formula_wales <-  adjvotingintention ~
+  (1 | ge2019) + (1 | ge2024) + (1|age_level:sex_level) +
+  (1 | edu_level) + (1 | euref) + (1 | econ_level) + (1 | ethn_level) + (1 | housing) + (1 | welsh_level) + (1 | rel_level) +
+  scale(depriv_index) + scale(avg_ruc) + scale(euref_leave) + scale(house_prices_perc) +
+  scale(military) + scale(students) + scale(pct_welshlang) + scale(pct_self_emp) + scale(ukip_2015) +
+  ge_lab + ge_libdem + ge_green + ge_pc + ge_ref + ge_oth + turnout +
+  council_lab + council_libdem + council_green +  council_other + council_pc
+
+# prior_wales <- c(prior(normal(0.13,1), class = b, dpar = muLabour),
+#                  prior(normal(0.08,1), class = b, dpar = muLiberalDemocrat),
+#                  prior(normal(0.21,1), class = b, dpar = muReformUK),
+#                  prior(normal(0.11,1), class = b, dpar = muTheGreenParty),
+#                  prior(normal(0.22,1), class = b, dpar = muWNV),
+#                  prior(normal(0.12,1), class = b, dpar = muPlaidCymru),
+#                  prior(normal(0,1), class = b, dpar = muOther))
+
+
+prior_wales <- c(prior(normal(0, 2), class = b, dpar = muLabour),
+                 prior(normal(0, 2), class = b, dpar = muLiberalDemocrat),
+                 prior(normal(0, 2), class = b, dpar = muReformUK),
+                 prior(normal(0, 2), class = b, dpar = muTheGreenParty),
+                 prior(normal(0, 2), class = b, dpar = muWNV),
+                 prior(normal(0, 2), class = b, dpar = muPlaidCymru),
+                 prior(normal(0, 2), class = b, dpar = muOther))
+
+print(Sys.time())
+model_wales <- brm(formula_wales,
+                   data=polldata_wales,
+                   family= categorical(link = "logit"),
+                   prior=prior_wales,
+                   seed=320,
+                   silent=0,
+                   iter=2500,
+                   backend="cmdstanr", 
+                   warmup=1000,
+                   chains=4,
+                   cores=4,
+                   refresh = 20)
+print(Sys.time())
+summary(model_wales)
+
+if (getwd() == "/root") {
+  saveRDS(model_wales, paste0("wales-",Sys.Date(),"_",model_desc,".rds"))
+} else {
+  saveRDS(model_wales,paste0("BRMS Models/wales-",Sys.Date(),"_",model_desc,".rds"))
+}
+
+#### england modelling ####
+
+formula_eng <-  adjvotingintention ~ 
+  (1 | ge2019) + (1 | ge2024) + (1|age_level:sex_level) +
+  (1 | edu_level) + (1 | euref) +  (1 | econ_level) +  (1 | ethn_level) + 
+  (1 | housing) + (1 | rel_level) + (1 | region_name) +
+  scale(depriv_index) +  scale(avg_ruc) + scale(euref_leave) + scale(house_prices_perc) +
+  scale(pct_self_emp) + scale(students) + scale(military) + scale(ukip_2015) +
+  ge_lab +  ge_libdem +  ge_green + ge_ref + ge_oth + turnout +
+  council_lab + council_libdem + council_green + council_ref + council_other
+
+# prior_eng <- c(prior(normal(0.17,1), dpar = muLabour),
+#                prior(normal(0.12,1), dpar = muLiberalDemocrat),
+#                prior(normal(0.25,1), dpar = muReformUK),
+#                prior(normal(0.08,1), dpar = muTheGreenParty),
+#                prior(normal(0.19,1), dpar = muWNV),
+#                prior(normal(0.03,1), dpar = muOther))
+
+prior_eng <- c(prior(normal(0, 2.5), dpar = muLabour),
+               prior(normal(0, 2.5), dpar = muLiberalDemocrat),
+               prior(normal(0, 2.5), dpar = muReformUK),
+               prior(normal(0, 2.5), dpar = muTheGreenParty),
+               prior(normal(0, 2.5), dpar = muWNV),
+               prior(normal(0, 2.5), dpar = muOther))
+
+print(Sys.time())
+model_eng <- brm(formula_eng,
+                 data=polldata_eng,
+                 family= categorical(link = "logit", refcat = NULL),
+                 prior=prior_eng,
+                 seed=320,
+                 silent=0,
+                 iter=2500,
+                 backend="cmdstanr", 
+                 warmup=1000,
+                 chains=4,
+                 cores=4,
+                 refresh = 20)
+print(Sys.time())
+summary(model_eng)
+
+if (getwd() == "/root") {
+  saveRDS(model_eng, paste0("eng-",Sys.Date(),"_",model_desc,".rds"))
+} else {
+  saveRDS(model_eng,paste0("BRMS Models/eng-",Sys.Date(),"_",model_desc,".rds"))
+}
+
+```
+
+
+
+
