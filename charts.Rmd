@@ -1,0 +1,101 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-12-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+## make predictions by demographic group and identify winner for Flourish map
+
+library(here)
+library(tidyverse)
+
+
+mrp_preds_edu <- read_csv("degree/dec2025_mrp_preds.csv") 
+
+
+mrp_edu_pct <- mrp_preds_edu %>% 
+  select(-WNV) %>% 
+  mutate(total = rowSums(pick(Conservative:`Scottish National Party (SNP)`), na.rm=TRUE), 
+         across(Conservative:`Scottish National Party (SNP)`, ~ .x/total * 100))  %>% 
+  pivot_longer(Conservative:`Scottish National Party (SNP)`, names_to="party", values_to = "pct") %>%
+  group_by(const_name, edu_level) %>% 
+  mutate(winner = party[which.max(pct)]) %>% 
+  pivot_wider(names_from=party, values_from=pct) %>% 
+  rename(Constituency = const_name) %>% 
+  select(Constituency, Conservative:`Scottish National Party (SNP)`, winner, edu_level)
+
+
+
+mrp_preds_as <- read_csv("age_sex/dec2025_mrp_preds.csv") 
+
+mrp_preds_as <- mrp_preds_as %>% 
+  filter(age_level %in% c("18-24")) %>% 
+  select(-WNV, -age_level) %>% 
+  group_by(const_name, sex_level) %>% 
+  summarise(across(Conservative:`Scottish National Party (SNP)`, \(x)sum(x, na.rm=TRUE)), .groups="drop") %>% 
+  pivot_longer(Conservative:`Scottish National Party (SNP)`, names_to="party", values_to = "pct") %>%
+  group_by(const_name, sex_level) %>% 
+  mutate(pct = pct/sum(pct) * 100) %>%
+  mutate(Winner = party[which.max(pct)]) %>% 
+  pivot_wider(names_from=party, values_from=pct) %>% 
+  rename(Constituency = const_name) %>% 
+  select(Constituency, Conservative:`Scottish National Party (SNP)`, Winner, sex_level)
+
+mrp_preds_male <- mrp_preds_as %>% 
+  filter(sex_level == "Male") %>% 
+  ungroup %>% 
+  select(-sex_level)
+
+mrp_preds_female <- mrp_preds_as %>% 
+  filter(sex_level == "Female") %>% 
+  ungroup %>% 
+  select(-sex_level)
+
+##"25-34"
+
+write.csv(mrp_preds_male, here("graph_data", "young_men_2.csv"), row.names = FALSE)
+
+
+write.csv(mrp_preds_female, here("graph_data", "young_women_2.csv"), row.names = FALSE)
+
+
+
+table(mrp_preds_male$Winner)
+
+
+table(mrp_preds_female$Winner)
+
+
+mrp_preds <- read_csv("overall/overlay_preds.csv") 
+
+colnames(mrp_preds) <- gsub("\\.", " ", colnames(mrp_preds))
+
+margin <- mrp_preds %>% 
+ # select(-WNV) %>% 
+  pivot_longer(Conservative:`Scottish National Party  SNP `, names_to="party", values_to = "vote") %>%
+  group_by(Constituency) %>% 
+  mutate(pct = vote/sum(vote, na.rm=TRUE) * 100) %>% 
+  summarise(winner = party[which.max(pct)], 
+         mov = rev(diff(sort(pct)))[1]) %>% 
+  mutate(margin = case_when(
+    mov < 5 ~ "Less than 5%",
+    mov >=5 & mov < 10 ~ "5-10%",
+    mov >=10 & mov < 15 ~ "10-15%",
+    mov >=15 & mov < 20 ~ "15-20%", 
+    mov >= 20 & mov <= 25 ~ "20-25%",
+    mov > 25 ~ "More than 25%"
+  ), 
+  margin = factor(margin, levels = c("Less than 5%", "5-10%", "10-15%", "15-20%", "20-25%", "More than 25%"))) 
+
+
+
+
+table(margin$margin)
+
+

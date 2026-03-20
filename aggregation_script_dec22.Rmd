@@ -1,0 +1,328 @@
+---
+title: "clean_flourish"
+output: html_document
+date: "2025-12-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(here)
+library(tidyverse)
+library(flextable)
+
+```
+
+```{r}
+
+mrp_preds <- read_csv(here("data","dec2025_mrp_preds.csv"))
+
+ge_2024 <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/other-files/ge2024_results.csv") 
+
+
+
+mrp_preds <- mrp_preds %>%
+  left_join(ge_2024 %>% select(const_name, winner, region), by = "const_name") %>%
+  rename(ge_2024_winner = winner)
+
+```
+
+```{r}
+
+## prepare for flourish 
+
+
+mrp_preds <- mrp_preds %>% 
+  rename(Green = "The Green Party", 
+         SNP = "Scottish National Party (SNP)", 
+         "Liberal Democrats" = "Liberal Democrat")
+
+
+party_cols <- c("Conservative", "Labour", "Liberal Democrats", "Other", 
+                "Plaid Cymru", "Reform UK", "Green", 
+                "SNP")
+
+mrp_results_flourish <- mrp_preds %>%
+  mutate(across(all_of(party_cols), ~replace_na(., 0))) %>%
+  select(-any_of("WNV")) %>%
+  # Rescale to sum to 1
+  mutate(
+    row_sum = rowSums(across(all_of(party_cols))),
+    across(all_of(party_cols), ~ . / row_sum)
+  ) %>%
+  select(-row_sum) %>%
+  rowwise() %>%
+  mutate(
+    new_winner = party_cols[which.max(c_across(all_of(party_cols)))]
+  ) %>%
+  ungroup() %>%
+  mutate(
+    change = case_when(
+      new_winner == ge_2024_winner ~ paste(new_winner, "HOLD"),
+      new_winner != ge_2024_winner ~ paste(new_winner, "GAIN from", ge_2024_winner),
+      TRUE ~ NA_character_
+    )
+  )
+
+options(scipen = 999)
+        
+mrp_results_flourish <- mrp_results_flourish %>%
+  mutate(across(all_of(party_cols), ~round(., 6)))
+
+
+
+
+mrp_results_flourish <- mrp_results_flourish %>%
+  mutate(across(where(is.numeric), ~ . * 100))
+
+
+
+
+write.csv(here(mrp_results_flourish, ))
+
+
+table(mrp_results_flourish$new_winner)
+
+table(mrp_results_flourish$change)
+
+
+
+table(mrp_results_flourish$change)
+
+
+write.csv(mrp_results_flourish, here("results", "overall_results.csv"), row.names = FALSE)
+
+
+
+```
+
+```{r}
+
+# Function to process MRP predictions and calculate vote distributions across different groupings
+## default is remove would not vote - if want to have differneital tunrout switch order in rbackers in line 112
+
+make_preds <- function(mrp_predictions, group_var, wnv = c("remove", "turnout"), ...) {
+  
+  # Match the wnv argument to either "turnout" or "remove"
+  w <- match.arg(wnv)
+  
+  # If "remove" is selected, redistribute votes excluding WNV (Would Not Vote/abstentions) take them out and renomalize
+  if (w == "remove") {
+    mrp_predictions <- mrp_predictions %>% 
+      select(-WNV) %>% 
+      pivot_longer(Conservative:`Scottish National Party (SNP)`,
+                   names_to = "party", values_to = "vote") %>%
+      group_by(const_name) %>% 
+      # Renormalize vote shares to sum to 1 after removing WNV
+      mutate(vote = round(vote / sum(vote, na.rm = TRUE) * 100, 2)) %>% 
+      pivot_wider(names_from = "party", values_from = "vote")
+    
+  } else {
+    mrp_predictions <- mrp_predictions %>% 
+      mutate(turnout = 1 - WNV) %>% 
+      select(-WNV) %>% 
+      mutate(across(Conservative:`Scottish National Party (SNP)`, ~ .x * turnout))  %>% 
+      pivot_longer(Conservative:`Scottish National Party (SNP)`,
+                   names_to = "party", values_to = "vote") %>%
+      group_by(const_name) %>% 
+      mutate(vote = round(vote / sum(vote, na.rm = TRUE) * 100, 2)) %>%
+      pivot_wider(names_from = "party", values_from = "vote") %>%
+      select(-turnout)
+  }
+  
+  # Calculate the joint distribution: average vote shares by grouping variable and region
+  joint_dist <- mrp_predictions %>%
+    group_by(across(any_of(c(group_var, "region")))) %>% 
+    summarise(
+      across(Conservative:`Scottish National Party (SNP)`,
+             ~ round(mean(.x, na.rm = TRUE), 2)),
+      .groups = "drop"
+    )
+  
+  # Calculate within-party distribution
+  within_party <- joint_dist %>% 
+    pivot_longer(-c(all_of(group_var), "region"),
+                 names_to = "party", values_to = "vote") %>%
+    group_by(region, party) %>% 
+    mutate(vote = round(vote / sum(vote, na.rm = TRUE) * 100, 2)) %>% 
+    pivot_wider(names_from = "party", values_from = "vote")
+  
+  # Calculate within-group distribution
+  within_group <- joint_dist %>% 
+    mutate(
+      row_total = rowSums(pick(Conservative:`Scottish National Party (SNP)`), na.rm = TRUE)
+    ) %>%
+    mutate(
+      across(Conservative:`Scottish National Party (SNP)`, ~ round(.x / row_total * 100, 2))
+    ) %>%
+    select(-row_total)
+  
+  return(
+    list(
+      joint_dist   = joint_dist,
+      within_party = within_party,
+      within_group = within_group
+    )
+  )
+}
+
+## joint is the proportion of voters that have the group attribute _and_ vote for the party. 
+
+## Within-party is the proportion of votes that come to that party from each group - depends on the distribution of the groups in the population
+## these sum to 1 within the column (by region).
+
+## within-group is the proportion of votes for each party from members of that group. 
+## These sum to 1 in the row. 
+
+## Both the within-group and within-party summaries are derived from the joint distribution.  The joint distribution will depend on the distirbution
+## of group attributes in the population. E.g., if there are more people without degrees in the population, the shares in the non-degree group are going 
+## to be bigger.  This generates some occasionally counter-intuitive looking results in the within-party analysis.  This is not a concern in the within-group
+## analysis because the shares of the demographic group in the population do not enter into the calculation.  
+```
+
+```{r}
+
+
+const_to_region <- read.csv("https://mrp-psf.ams3.digitaloceanspaces.com/other-files/Const%20to%20region.csv") %>% 
+  mutate(region = case_when(region == "Scotland" ~ "Scotland", region == "Wales" ~ "Wales", TRUE ~ "England"))
+
+
+```
+
+
+
+```{r}
+## Education = within group
+
+
+mrp_preds_edu <- read_csv("degree/dec2025_mrp_preds.csv") %>% 
+  left_join(const_to_region) 
+
+
+ edu_aggregate <- make_preds(mrp_preds_edu, "edu_level")
+ 
+  View(edu_aggregate$joint_dist)
+  View(edu_aggregate$within_party)
+  View(edu_aggregate$within_group)
+
+  
+     
+arrange(edu_aggregate$within_group, region, edu_level)
+
+
+  
+ edu_within_group <- edu_aggregate$within_group %>%
+  as_tibble() %>%
+  arrange(region, edu_level)
+ 
+ 
+ 
+write.csv(edu_within_group, here("results", "education_within.csv"), row.names = FALSE)
+
+
+ft <- flextable(edu_within_group)
+
+save_as_docx(ft, path = here("results", "education_within.docx"))
+ 
+
+```
+
+
+```{r}
+
+## within group age 
+
+mrp_preds_age <- read_csv("age/dec2025_mrp_preds.csv") %>% 
+  left_join(const_to_region) 
+
+
+ age_aggregate <- make_preds(mrp_preds_age, "age_level")
+ 
+  View(age_aggregate$joint_dist)
+  View(age_aggregate$within_party)
+  View(age_aggregate$within_group)
+
+
+  arrange(age_aggregate$within_group, region, age_level)
+  
+  
+  age_within_group <- age_aggregate$within_group %>%
+  as_tibble() %>%
+  arrange(region, age_level)
+  
+  
+write.csv(age_within_group, here("results", "age_within.csv"), row.names = FALSE)
+  
+  
+
+```
+
+```{r}
+## age sex
+
+
+mrp_preds_age_sex <- read_csv("age_sex/dec2025_mrp_preds.csv") %>% 
+  left_join(const_to_region)
+
+age_sex_aggregate <- make_preds(
+  mrp_predictions = mrp_preds_age_sex,
+  group_var       = c("age_level", "sex_level")
+)
+
+# Drop the total component if make_preds() returns it
+age_sex_aggregate$total <- NULL
+
+View(age_sex_aggregate$joint_dist)
+View(age_sex_aggregate$within_party)
+View(age_sex_aggregate$within_group)
+
+ 
+age_sex_aggregate$within_group <- age_sex_aggregate$within_group %>%
+  arrange(region, age_level, sex_level)
+
+  
+  age_sex_within_group <- age_sex_aggregate$within_group %>%
+  as_tibble() %>%
+  arrange(region, age_level, sex_level)
+  
+  
+  
+  
+write.csv(age_sex_within_group, here("results", "age_sex_within.csv"), row.names = FALSE)
+  
+
+
+
+
+
+```
+
+```{r}
+
+## ethnicity
+  
+ 
+ mrp_preds_ethn <- read_csv("ethnicity/dec2025_mrp_preds.csv") %>% 
+left_join(const_to_region)
+
+
+ethnic_aggregate <- make_preds(mrp_preds_ethn, "ethn_level")
+ 
+  View(ethnic_aggregate$joint_dist)
+  View(ethnic_aggregate$within_party)
+  View(ethnic_aggregate$within_group)
+
+
+  arrange(ethnic_aggregate$within_group, region, ethn_level)
+  
+  
+  ethnic_within_group <- ethnic_aggregate$within_group %>%
+  as_tibble() %>%
+  arrange(region, ethn_level)
+  
+
+
+  
+write.csv(ethnic_within_group, here("results", "ethnicity_results.csv"), row.names = FALSE)
